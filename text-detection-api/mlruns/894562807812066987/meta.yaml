@@ -1,0 +1,6 @@
+artifact_location: file:///app/mlruns/894562807812066987
+creation_time: 1744105138353
+experiment_id: '894562807812066987'
+last_update_time: 1744105138353
+lifecycle_stage: active
+name: TextDetectionAPI

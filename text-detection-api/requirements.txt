@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+easyocr
+numpy
+opencv-python
+Pillow
+mlflow
+python-multipart
+psycopg2-binary
+minio

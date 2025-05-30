@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+easyocr
+numpy
+opencv-python
+Pillow
+PyPDF2
+pdf2image
+mlflow
+psycopg2-binary  
+minio
