@@ -1,3 +1,4 @@
+import datetime
 import os
 import io
 import json
@@ -17,11 +18,19 @@ import PyPDF2
 from pdf2image import convert_from_bytes
 from fastapi.responses import JSONResponse
 from fastapi import Request
+from fastapi.middleware.cors import CORSMiddleware
 # Configure MLflow tracking URI
 mlflow.set_tracking_uri("http://mlflow:5000")
 # Initialize FastAPI app
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8080", "http://localhost:3000"],  # Include possible frontend ports
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # Environment variables
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", 5432))
@@ -309,39 +318,26 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
-    # Temporarily disable MLflow
-    # try:
-    #     with mlflow.start_run():
-    #         mlflow.log_param("threshold", threshold)
-    #         mlflow.log_param("num_files", len(files))
-    #         mlflow.log_param("return_images", return_images)
-
     for file in files:
         filename = file.filename
-
-        # Read file data
-        try:
-            file_data = await file.read()
-            if not file_data:
-                results.append({
-                    "filename": filename,
-                    "detections": [{"text": "Error: Empty file", "confidence": 0.0, "bounding_box": None, "page_number": None, "is_embedded_image": False, "source": "error"}],
-                    "images_base64": []
-                })
-                continue
-        except Exception as e:
+        print(f"Starting processing for file: {filename}")
+        file_data = await file.read()
+        print(f"File data length: {len(file_data)} bytes")
+        if not file_data:
+            print(f"Empty file: {filename}")
             results.append({
                 "filename": filename,
-                "detections": [{"text": f"Error reading file: {str(e)}", "confidence": 0.0, "bounding_box": None, "page_number": None, "is_embedded_image": False, "source": "error"}],
+                "detections": [{"text": "Error: Empty file", "confidence": 0.0, "bounding_box": None, "page_number": None, "is_embedded_image": False, "source": "error"}],
                 "images_base64": []
             })
             continue
 
-        # Save original file to MinIO
         original_path = f"originals/{filename}"
         try:
             minio_client.put_object(MINIO_BUCKET, original_path, io.BytesIO(file_data), len(file_data))
+            print(f"Saved original file to MinIO: {original_path}")
         except S3Error as e:
+            print(f"MinIO error for {filename}: {str(e)}")
             results.append({
                 "filename": filename,
                 "detections": [{"text": f"Failed to save file to MinIO: {str(e)}", "confidence": 0.0, "bounding_box": None, "page_number": None, "is_embedded_image": False, "source": "error"}],
@@ -349,10 +345,11 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
             })
             continue
 
-        # Detect text using the model
         try:
             detections, file_detections, file_confidence, images_base64 = detect_text_from_file(file_data, filename, threshold, return_images)
+            print(f"Detections for {filename}: {detections}")
         except Exception as e:
+            print(f"OCR error for {filename}: {str(e)}")
             results.append({
                 "filename": filename,
                 "detections": [{"text": f"Error in OCR processing: {str(e)}", "confidence": 0.0, "bounding_box": None, "page_number": None, "is_embedded_image": False, "source": "error"}],
@@ -360,31 +357,23 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
             })
             continue
 
-        # Update totals
         total_detections += file_detections
         total_confidence += file_confidence
 
-        # Save detections to PostgreSQL and MinIO
         annotated_paths = {}
         if return_images:
             for img_info in images_base64:
                 page_num = img_info["page_number"]
                 is_embedded = img_info["is_embedded_image"]
                 image_base64 = img_info["image_base64"]
-
-                # Decode base64 image to save to MinIO
                 try:
                     image_bytes = base64.b64decode(image_base64)
                     image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
-
-                    # Generate annotated filename
                     if page_num:
                         annotated_filename = f"{filename}_page_{page_num}.png"
                     else:
                         annotated_filename = filename
                     annotated_path = f"annotated/{annotated_filename}"
-
-                    # Save annotated image to MinIO
                     _, buffer = cv2.imencode(".png", image)
                     minio_client.put_object(MINIO_BUCKET, annotated_path, io.BytesIO(buffer.tobytes()), len(buffer))
                     annotated_paths[(page_num, is_embedded)] = annotated_path
@@ -392,19 +381,15 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
                     print(f"Failed to save annotated image to MinIO: {str(e)}")
 
         for detection in detections:
-            # Prepare data for PostgreSQL
             text = detection["text"]
-            confidence = detection["confidence"]
+            confidence = float(detection["confidence"])  # Convert np.float64 to float
             bounding_box = detection.get("bounding_box")
             page_number = detection.get("page_number")
             is_embedded_image = detection["is_embedded_image"]
-
-            # Determine annotated URL
             annotated_url = None
             if return_images and (page_number, is_embedded_image) in annotated_paths:
                 annotated_url = annotated_paths[(page_number, is_embedded_image)]
 
-            # Insert detection into PostgreSQL
             try:
                 cursor.execute(
                     """
@@ -415,11 +400,11 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
                     (filename, original_path, annotated_url, text, confidence, json.dumps(bounding_box) if bounding_box else None, page_number, is_embedded_image)
                 )
                 conn.commit()
+                print(f"Inserted detection into database for {filename}: {text}")
             except psycopg2.Error as e:
                 conn.rollback()
-                print(f"Failed to insert detection into PostgreSQL: {str(e)}")
+                print(f"Database insertion error for {filename}: {str(e)}")
 
-        # Prepare result for this file
         result = {
             "filename": filename,
             "detections": detections,
@@ -427,22 +412,63 @@ async def detect_text_multiple(files: List[UploadFile] = File(...), threshold: f
         }
         results.append(result)
 
-    # Log metrics to MLflow (temporarily disabled)
-    # processing_time = time.time() - start_time
-    # average_confidence = total_confidence / total_detections if total_detections > 0 else 0
-    # mlflow.log_metric("processing_time", processing_time)
-    # mlflow.log_metric("total_detections", total_detections)
-    # mlflow.log_metric("average_confidence", average_confidence)
+    return {"status": "success", "results": results}
+import logging
 
-    # except Exception as e:
-    #     raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-    # Return response
-    return {
-        "status": "success",
-        "results": results
-    }
-
+@app.get("/history/")
+def get_history():
+    try:
+        logger.debug("Entering get_history function")
+        with conn.cursor() as cursor:
+            logger.debug("Executing SQL query")
+            cursor.execute("SELECT * FROM detections ORDER BY created_at DESC")
+            rows = cursor.fetchall()
+            logger.debug(f"Rows fetched: {rows}")
+            columns = [desc[0] for desc in cursor.description]
+            results = []
+            for i, row in enumerate(rows):
+                logger.debug(f"Processing row {i}: {row}")
+                row_dict = dict(zip(columns, row))
+                logger.debug(f"Raw row_dict: {row_dict}")
+                for key, value in row_dict.items():
+                    if value is not None:
+                        try:
+                            if isinstance(value, (bytes, bytearray)):
+                                row_dict[key] = value.decode('utf-8')
+                            elif isinstance(value, datetime):
+                                row_dict[key] = value.isoformat()  # e.g., "2025-06-03T19:43:56.952345"
+                            elif key == "bounding_box" and isinstance(value, str):
+                                try:
+                                    row_dict[key] = json.loads(value)  # Parse string to dict if valid JSON
+                                except json.JSONDecodeError:
+                                    row_dict[key] = None  # Fallback if invalid
+                            elif isinstance(value, (list, dict)):
+                                row_dict[key] = json.dumps(value)  # Ensure proper JSON string
+                            elif key == "confidence":
+                                row_dict[key] = float(value)  # Convert to float
+                            elif key == "id":
+                                row_dict[key] = int(value)  # Convert to int
+                            elif key == "is_embedded_image":
+                                row_dict[key] = bool(value.lower() == "true")  # Convert to boolean
+                            else:
+                                row_dict[key] = str(value)  # Default to string
+                        except (ValueError, TypeError) as e:
+                            logger.error(f"Conversion error for key {key}, value {value}: {e}")
+                            row_dict[key] = str(value)  # Fallback to string
+                logger.debug(f"Processed row_dict {i}: {row_dict}")
+                results.append(row_dict)
+            logger.debug(f"Results before return: {results}")
+            response = {"status": "success", "results": results}
+            return JSONResponse(content=response)
+    except psycopg2.Error as e:
+        logger.error(f"Database error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+    except Exception as e:
+        logger.error(f"Internal error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 # Cleanup on shutdown
 @app.on_event("shutdown")
 def shutdown_event():
